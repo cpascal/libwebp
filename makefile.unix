@@ -2,8 +2,7 @@
 # system, for simple local building of the libraries and tools.
 # It will not install the libraries system-wide, but just create the 'cwebp'
 # and 'dwebp' tools in the examples/ directory, along with the static
-# libraries 'src/libwebp.a', 'src/mux/libwebpmux.a' and
-# 'src/demux/libwebpdemux.a'.
+# libraries 'src/libwebp.a' and 'src/mux/libwebpmux.a'.
 #
 # To build the library and examples, use:
 #    make -f makefile.unix
@@ -11,14 +10,10 @@
 
 #### Customizable part ####
 
-# These flags assume you have libpng, libjpeg, libtiff and libgif installed. If
-# not, either follow the install instructions below or just comment out the next
-# four lines.
+# These flag assume you have libpng and libjpeg installed. If not, either
+# follow below install instructions or just comment out the next lines.
 EXTRA_FLAGS= -DWEBP_HAVE_PNG -DWEBP_HAVE_JPEG -DWEBP_HAVE_TIFF
-DWEBP_LIBS= -lpng -lz
-CWEBP_LIBS= $(DWEBP_LIBS) -ljpeg -ltiff
-GIF_LIBS = -lgif
-
+EXTRA_LIBS= -lpng -ltiff -ljpeg -lz
 ifeq ($(strip $(shell uname)), Darwin)
   # Work around a problem linking tables marked as common symbols,
   # cf., src/enc/yuv.[hc]
@@ -31,19 +26,16 @@ else
   GL_LIBS = -lglut -lGL
 endif
 
-
 # To install libraries on Mac OS X:
 # 1. Install MacPorts (http://www.macports.org/install.php)
 # 2. Run "sudo port install jpeg"
 # 3. Run "sudo port install libpng"
 # 4. Run "sudo port install tiff"
-# 5. Run "sudo port install giflib"
 
 # To install libraries on Linux:
 # 1. Run "sudo apt-get install libjpeg62-dev"
 # 2. Run "sudo apt-get install libpng12-dev"
 # 3. Run "sudo apt-get install libtiff4-dev"
-# 4. Run "sudo apt-get install libgif-dev"
 
 # Uncomment for build for 32bit platform
 # Alternatively, you can just use the command
@@ -52,9 +44,6 @@ endif
 
 # Extra flags to enable experimental features and code
 # EXTRA_FLAGS += -DWEBP_EXPERIMENTAL_FEATURES
-
-# Extra flags to enable byte swap for 16 bit colorspaces.
-# EXTRA_FLAGS += -DWEBP_SWAP_16BIT_CSP
 
 # Extra flags to enable multi-threading
 EXTRA_FLAGS += -DWEBP_USE_THREAD
@@ -65,7 +54,6 @@ EXTRA_FLAGS += -Wextra -Wold-style-definition
 EXTRA_FLAGS += -Wmissing-prototypes
 EXTRA_FLAGS += -Wmissing-declarations
 EXTRA_FLAGS += -Wdeclaration-after-statement
-EXTRA_FLAGS += -Wshadow
 # EXTRA_FLAGS += -Wvla
 
 #### Nothing should normally be changed below this line ####
@@ -93,20 +81,15 @@ DEC_OBJS = \
     src/dec/vp8l.o \
     src/dec/webp.o \
 
-DEMUX_OBJS = \
-    src/demux/demux.o \
-
 DSP_OBJS = \
     src/dsp/cpu.o \
     src/dsp/dec.o \
     src/dsp/dec_neon.o \
     src/dsp/dec_sse2.o \
     src/dsp/enc.o \
-    src/dsp/enc_neon.o \
     src/dsp/enc_sse2.o \
     src/dsp/lossless.o \
     src/dsp/upsampling.o \
-    src/dsp/upsampling_neon.o \
     src/dsp/upsampling_sse2.o \
     src/dsp/yuv.o \
 
@@ -124,21 +107,15 @@ ENC_OBJS = \
     src/enc/picture.o \
     src/enc/quant.o \
     src/enc/syntax.o \
-    src/enc/token.o \
     src/enc/tree.o \
     src/enc/vp8l.o \
     src/enc/webpenc.o \
-
-EX_FORMAT_DEC_OBJS = \
-    examples/jpegdec.o \
-    examples/metadata.o \
-    examples/pngdec.o \
-    examples/tiffdec.o \
 
 EX_UTIL_OBJS = \
     examples/example_util.o \
 
 MUX_OBJS = \
+    src/mux/demux.o \
     src/mux/muxedit.o \
     src/mux/muxinternal.o \
     src/mux/muxread.o \
@@ -157,7 +134,6 @@ UTILS_OBJS = \
 
 LIBWEBP_OBJS = $(DEC_OBJS) $(DSP_OBJS) $(ENC_OBJS) $(UTILS_OBJS)
 LIBWEBPMUX_OBJS = $(MUX_OBJS)
-LIBWEBPDEMUX_OBJS = $(DEMUX_OBJS)
 
 HDRS_INSTALLED = \
     src/webp/decode.h \
@@ -183,10 +159,8 @@ HDRS = \
     src/utils/quant_levels.h \
     src/utils/rescaler.h \
     src/utils/thread.h \
-    src/webp/demux.h \
     src/webp/format_constants.h \
     src/webp/mux.h \
-    src/webp/mux_types.h \
     $(HDRS_INSTALLED) \
 
 OUT_LIBS = examples/libexample_util.a src/libwebp.a
@@ -194,13 +168,10 @@ OUT_EXAMPLES = examples/cwebp examples/dwebp
 
 OUTPUT = $(OUT_LIBS) $(OUT_EXAMPLES)
 ifeq ($(MAKECMDGOALS),clean)
-  OUTPUT += examples/gif2webp examples/vwebp examples/webpmux
-  OUTPUT += src/demux/libwebpdemux.a src/mux/libwebpmux.a
+  OUTPUT += examples/vwebp examples/webpmux src/mux/libwebpmux.a
 endif
 
 all: ex
-
-$(EX_FORMAT_DEC_OBJS): %.o: %.h
 
 %.o: %.c $(HDRS)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
@@ -208,31 +179,24 @@ $(EX_FORMAT_DEC_OBJS): %.o: %.h
 examples/libexample_util.a: $(EX_UTIL_OBJS)
 src/libwebp.a: $(LIBWEBP_OBJS)
 src/mux/libwebpmux.a: $(LIBWEBPMUX_OBJS)
-src/demux/libwebpdemux.a: $(LIBWEBPDEMUX_OBJS)
 
 %.a:
 	$(AR) $(ARFLAGS) $@ $^
 
 ex: $(OUT_EXAMPLES)
 
-examples/cwebp: examples/cwebp.o $(EX_FORMAT_DEC_OBJS)
+examples/cwebp: examples/cwebp.o
 examples/dwebp: examples/dwebp.o
-examples/gif2webp: examples/gif2webp.o
 examples/vwebp: examples/vwebp.o
 examples/webpmux: examples/webpmux.o
 
 examples/cwebp: src/libwebp.a
-examples/cwebp: EXTRA_LIBS += $(CWEBP_LIBS)
 examples/dwebp: examples/libexample_util.a src/libwebp.a
-examples/dwebp: EXTRA_LIBS += $(DWEBP_LIBS)
-examples/gif2webp: examples/libexample_util.a src/mux/libwebpmux.a src/libwebp.a
-examples/gif2webp: EXTRA_LIBS += $(GIF_LIBS)
-examples/vwebp: examples/libexample_util.a src/demux/libwebpdemux.a
-examples/vwebp: src/libwebp.a
+examples/vwebp: examples/libexample_util.a src/mux/libwebpmux.a src/libwebp.a
 examples/vwebp: EXTRA_LIBS += $(GL_LIBS)
 examples/webpmux: examples/libexample_util.a src/mux/libwebpmux.a src/libwebp.a
 
-$(OUT_EXAMPLES) examples/gif2webp examples/vwebp examples/webpmux:
+$(OUT_EXAMPLES) examples/vwebp examples/webpmux:
 	$(CC) -o $@ $^ $(LDFLAGS)
 
 dist: DESTDIR := dist
@@ -255,7 +219,6 @@ clean:
 	$(RM) $(OUTPUT) *~ \
               examples/*.o examples/*~ \
               src/dec/*.o src/dec/*~ \
-              src/demux/*.o src/demux/*~ \
               src/dsp/*.o src/dsp/*~ \
               src/enc/*.o src/enc/*~ \
               src/mux/*.o src/mux/*~ \

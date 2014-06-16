@@ -35,7 +35,6 @@ LOCAL_SRC_FILES := \
     src/enc/picture.c \
     src/enc/quant.c \
     src/enc/syntax.c \
-    src/enc/token.c \
     src/enc/tree.c \
     src/enc/vp8l.c \
     src/enc/webpenc.c \
@@ -62,8 +61,6 @@ ifeq ($(TARGET_ARCH_ABI),armeabi-v7a)
   # instructions to be generated for armv7a code. Instead target the neon code
   # specifically.
   LOCAL_SRC_FILES += src/dsp/dec_neon.c.neon
-  LOCAL_SRC_FILES += src/dsp/upsampling_neon.c.neon
-  LOCAL_SRC_FILES += src/dsp/enc_neon.c.neon
 endif
 LOCAL_STATIC_LIBRARIES := cpufeatures
 

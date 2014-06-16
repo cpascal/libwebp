@@ -18,16 +18,35 @@
 #include "config.h"
 #endif
 
+#ifdef WEBP_HAVE_PNG
+#include <png.h>
+#endif
+
+#ifdef WEBP_HAVE_JPEG
+#include <setjmp.h>   // note: this must be included *after* png.h
+#include <jpeglib.h>
+#endif
+
+#ifdef WEBP_HAVE_TIFF
+#include <tiffio.h>
+#endif
+
+#ifdef HAVE_WINCODEC_H
+#ifdef __MINGW32__
+#define INITGUID  // Without this GUIDs are declared extern and fail to link
+#endif
+#define CINTERFACE
+#define COBJMACROS
+#define _WIN32_IE 0x500  // Workaround bug in shlwapi.h when compiling C++
+                         // code with COBJMACROS.
+#include <shlwapi.h>
+#include <windows.h>
+#include <wincodec.h>
+#endif  /* HAVE_WINCODEC_H */
+
+
 #include "webp/encode.h"
-
-#include "./metadata.h"
 #include "./stopwatch.h"
-
-#include "./jpegdec.h"
-#include "./pngdec.h"
-#include "./tiffdec.h"
-#include "./wicdec.h"
-
 #ifndef WEBP_DLL
 #if defined(__cplusplus) || defined(c_plusplus)
 extern "C" {
@@ -76,8 +95,182 @@ static int ReadYUV(FILE* in_file, WebPPicture* const pic) {
 
 #ifdef HAVE_WINCODEC_H
 
+#define IFS(fn)                                                     \
+  do {                                                              \
+     if (SUCCEEDED(hr)) {                                           \
+        hr = (fn);                                                  \
+        if (FAILED(hr)) fprintf(stderr, #fn " failed %08x\n", hr);  \
+     }                                                              \
+  } while (0)
+
+// modified version of DEFINE_GUID from guiddef.h.
+#define WEBP_DEFINE_GUID(name, l, w1, w2, b1, b2, b3, b4, b5, b6, b7, b8) \
+  const GUID name = { l, w1, w2, { b1, b2,  b3,  b4,  b5,  b6,  b7,  b8 } }
+
+#ifdef __cplusplus
+#define MAKE_REFGUID(x) (x)
+#else
+#define MAKE_REFGUID(x) &(x)
+#endif
+
+typedef struct WICFormatImporter {
+  const GUID* pixel_format;
+  int bytes_per_pixel;
+  int (*import)(WebPPicture* const, const uint8_t* const, int);
+} WICFormatImporter;
+
+static HRESULT OpenInputStream(const char* filename, IStream** ppStream) {
+  HRESULT hr = S_OK;
+  IFS(SHCreateStreamOnFileA(filename, STGM_READ, ppStream));
+  if (FAILED(hr))
+    fprintf(stderr, "Error opening input file %s (%08x)\n", filename, hr);
+  return hr;
+}
+
+static HRESULT ReadPictureWithWIC(const char* filename,
+                                  WebPPicture* const pic, int keep_alpha) {
+  // From Microsoft SDK 7.0a -- wincodec.h
+  // Create local copies for compatibility when building against earlier
+  // versions of the SDK.
+  WEBP_DEFINE_GUID(GUID_WICPixelFormat24bppBGR_,
+                   0x6fddc324, 0x4e03, 0x4bfe,
+                   0xb1, 0x85, 0x3d, 0x77, 0x76, 0x8d, 0xc9, 0x0c);
+  WEBP_DEFINE_GUID(GUID_WICPixelFormat24bppRGB_,
+                   0x6fddc324, 0x4e03, 0x4bfe,
+                   0xb1, 0x85, 0x3d, 0x77, 0x76, 0x8d, 0xc9, 0x0d);
+  WEBP_DEFINE_GUID(GUID_WICPixelFormat32bppBGRA_,
+                   0x6fddc324, 0x4e03, 0x4bfe,
+                   0xb1, 0x85, 0x3d, 0x77, 0x76, 0x8d, 0xc9, 0x0f);
+  WEBP_DEFINE_GUID(GUID_WICPixelFormat32bppRGBA_,
+                   0xf5c7ad2d, 0x6a8d, 0x43dd,
+                   0xa7, 0xa8, 0xa2, 0x99, 0x35, 0x26, 0x1a, 0xe9);
+  const WICFormatImporter alphaFormatImporters[] = {
+    { &GUID_WICPixelFormat32bppBGRA_, 4, WebPPictureImportBGRA },
+    { &GUID_WICPixelFormat32bppRGBA_, 4, WebPPictureImportRGBA },
+    { NULL, 0, NULL },
+  };
+  const WICFormatImporter nonAlphaFormatImporters[] = {
+    { &GUID_WICPixelFormat24bppBGR_, 3, WebPPictureImportBGR },
+    { &GUID_WICPixelFormat24bppRGB_, 3, WebPPictureImportRGB },
+    { NULL, 0, NULL },
+  };
+  HRESULT hr = S_OK;
+  IWICBitmapFrameDecode* pFrame = NULL;
+  IWICFormatConverter* pConverter = NULL;
+  IWICImagingFactory* pFactory = NULL;
+  IWICBitmapDecoder* pDecoder = NULL;
+  IStream* pStream = NULL;
+  UINT frameCount = 0;
+  UINT width = 0, height = 0;
+  BYTE* rgb = NULL;
+  WICPixelFormatGUID srcPixelFormat = { 0 };
+  const WICFormatImporter* importer = NULL;
+  GUID srcContainerFormat = { 0 };
+  const GUID* alphaContainers[] = {
+    &GUID_ContainerFormatBmp,
+    &GUID_ContainerFormatPng,
+    &GUID_ContainerFormatTiff
+  };
+  int has_alpha = 0;
+  int i, stride;
+
+  IFS(CoInitialize(NULL));
+  IFS(CoCreateInstance(MAKE_REFGUID(CLSID_WICImagingFactory), NULL,
+          CLSCTX_INPROC_SERVER, MAKE_REFGUID(IID_IWICImagingFactory),
+          (LPVOID*)&pFactory));
+  if (hr == REGDB_E_CLASSNOTREG) {
+    fprintf(stderr,
+            "Couldn't access Windows Imaging Component (are you running "
+            "Windows XP SP3 or newer?). Most formats not available. "
+            "Use -s for the available YUV input.\n");
+  }
+  // Prepare for image decoding.
+  IFS(OpenInputStream(filename, &pStream));
+  IFS(IWICImagingFactory_CreateDecoderFromStream(pFactory, pStream, NULL,
+          WICDecodeMetadataCacheOnDemand, &pDecoder));
+  IFS(IWICBitmapDecoder_GetFrameCount(pDecoder, &frameCount));
+  if (SUCCEEDED(hr) && frameCount == 0) {
+    fprintf(stderr, "No frame found in input file.\n");
+    hr = E_FAIL;
+  }
+  IFS(IWICBitmapDecoder_GetFrame(pDecoder, 0, &pFrame));
+  IFS(IWICBitmapFrameDecode_GetPixelFormat(pFrame, &srcPixelFormat));
+  IFS(IWICBitmapDecoder_GetContainerFormat(pDecoder, &srcContainerFormat));
+
+  if (keep_alpha) {
+    for (i = 0;
+         i < sizeof(alphaContainers) / sizeof(alphaContainers[0]);
+         ++i) {
+      if (IsEqualGUID(MAKE_REFGUID(srcContainerFormat),
+                      MAKE_REFGUID(*alphaContainers[i]))) {
+        has_alpha =
+            IsEqualGUID(MAKE_REFGUID(srcPixelFormat),
+                        MAKE_REFGUID(GUID_WICPixelFormat32bppRGBA_)) ||
+            IsEqualGUID(MAKE_REFGUID(srcPixelFormat),
+                        MAKE_REFGUID(GUID_WICPixelFormat32bppBGRA_));
+        break;
+      }
+    }
+  }
+
+  // Prepare for pixel format conversion (if necessary).
+  IFS(IWICImagingFactory_CreateFormatConverter(pFactory, &pConverter));
+
+  for (importer = has_alpha ? alphaFormatImporters : nonAlphaFormatImporters;
+       hr == S_OK && importer->import != NULL; ++importer) {
+    BOOL canConvert;
+    const HRESULT cchr = IWICFormatConverter_CanConvert(
+        pConverter,
+        MAKE_REFGUID(srcPixelFormat),
+        MAKE_REFGUID(*importer->pixel_format),
+        &canConvert);
+    if (SUCCEEDED(cchr) && canConvert) break;
+  }
+  if (importer->import == NULL) hr = E_FAIL;
+
+  IFS(IWICFormatConverter_Initialize(pConverter, (IWICBitmapSource*)pFrame,
+          importer->pixel_format,
+          WICBitmapDitherTypeNone,
+          NULL, 0.0, WICBitmapPaletteTypeCustom));
+
+  // Decode.
+  IFS(IWICFormatConverter_GetSize(pConverter, &width, &height));
+  stride = importer->bytes_per_pixel * width * sizeof(*rgb);
+  if (SUCCEEDED(hr)) {
+    rgb = (BYTE*)malloc(stride * height);
+    if (rgb == NULL)
+      hr = E_OUTOFMEMORY;
+  }
+  IFS(IWICFormatConverter_CopyPixels(pConverter, NULL, stride,
+          stride * height, rgb));
+
+  // WebP conversion.
+  if (SUCCEEDED(hr)) {
+    int ok;
+    pic->width = width;
+    pic->height = height;
+    ok = importer->import(pic, rgb, stride);
+    if (!ok)
+      hr = E_FAIL;
+  }
+  if (SUCCEEDED(hr)) {
+    if (has_alpha && keep_alpha == 2) {
+      WebPCleanupTransparentArea(pic);
+    }
+  }
+
+  // Cleanup.
+  if (pConverter != NULL) IUnknown_Release(pConverter);
+  if (pFrame != NULL) IUnknown_Release(pFrame);
+  if (pDecoder != NULL) IUnknown_Release(pDecoder);
+  if (pFactory != NULL) IUnknown_Release(pFactory);
+  if (pStream != NULL) IUnknown_Release(pStream);
+  free(rgb);
+  return hr;
+}
+
 static int ReadPicture(const char* const filename, WebPPicture* const pic,
-                       int keep_alpha, Metadata* const metadata) {
+                       int keep_alpha) {
   int ok;
   if (pic->width != 0 && pic->height != 0) {
     // If image size is specified, infer it as YUV format.
@@ -90,7 +283,7 @@ static int ReadPicture(const char* const filename, WebPPicture* const pic,
     fclose(in_file);
   } else {
     // If no size specified, try to decode it using WIC.
-    ok = ReadPictureWithWIC(filename, pic, keep_alpha, metadata);
+    ok = SUCCEEDED(ReadPictureWithWIC(filename, pic, keep_alpha));
   }
   if (!ok) {
     fprintf(stderr, "Error! Could not process file %s\n", filename);
@@ -99,6 +292,262 @@ static int ReadPicture(const char* const filename, WebPPicture* const pic,
 }
 
 #else  // !HAVE_WINCODEC_H
+
+#ifdef WEBP_HAVE_JPEG
+struct my_error_mgr {
+  struct jpeg_error_mgr pub;
+  jmp_buf setjmp_buffer;
+};
+
+static void my_error_exit(j_common_ptr dinfo) {
+  struct my_error_mgr* myerr = (struct my_error_mgr*) dinfo->err;
+  (*dinfo->err->output_message) (dinfo);
+  longjmp(myerr->setjmp_buffer, 1);
+}
+
+static int ReadJPEG(FILE* in_file, WebPPicture* const pic) {
+  int ok = 0;
+  int stride, width, height;
+  uint8_t* rgb = NULL;
+  uint8_t* row_ptr = NULL;
+  struct jpeg_decompress_struct dinfo;
+  struct my_error_mgr jerr;
+  JSAMPARRAY buffer;
+
+  dinfo.err = jpeg_std_error(&jerr.pub);
+  jerr.pub.error_exit = my_error_exit;
+
+  if (setjmp(jerr.setjmp_buffer)) {
+ Error:
+    jpeg_destroy_decompress(&dinfo);
+    goto End;
+  }
+
+  jpeg_create_decompress(&dinfo);
+  jpeg_stdio_src(&dinfo, in_file);
+  jpeg_read_header(&dinfo, TRUE);
+
+  dinfo.out_color_space = JCS_RGB;
+  dinfo.dct_method = JDCT_IFAST;
+  dinfo.do_fancy_upsampling = TRUE;
+
+  jpeg_start_decompress(&dinfo);
+
+  if (dinfo.output_components != 3) {
+    goto Error;
+  }
+
+  width = dinfo.output_width;
+  height = dinfo.output_height;
+  stride = dinfo.output_width * dinfo.output_components * sizeof(*rgb);
+
+  rgb = (uint8_t*)malloc(stride * height);
+  if (rgb == NULL) {
+    goto End;
+  }
+  row_ptr = rgb;
+
+  buffer = (*dinfo.mem->alloc_sarray) ((j_common_ptr) &dinfo,
+                                       JPOOL_IMAGE, stride, 1);
+  if (buffer == NULL) {
+    goto End;
+  }
+
+  while (dinfo.output_scanline < dinfo.output_height) {
+    if (jpeg_read_scanlines(&dinfo, buffer, 1) != 1) {
+      goto End;
+    }
+    memcpy(row_ptr, buffer[0], stride);
+    row_ptr += stride;
+  }
+
+  jpeg_finish_decompress(&dinfo);
+  jpeg_destroy_decompress(&dinfo);
+
+  // WebP conversion.
+  pic->width = width;
+  pic->height = height;
+  ok = WebPPictureImportRGB(pic, rgb, stride);
+
+ End:
+  if (rgb) {
+    free(rgb);
+  }
+  return ok;
+}
+
+#else
+static int ReadJPEG(FILE* in_file, WebPPicture* const pic) {
+  (void)in_file;
+  (void)pic;
+  fprintf(stderr, "JPEG support not compiled. Please install the libjpeg "
+          "development package before building.\n");
+  return 0;
+}
+#endif
+
+#ifdef WEBP_HAVE_PNG
+static void PNGAPI error_function(png_structp png, png_const_charp dummy) {
+  (void)dummy;  // remove variable-unused warning
+  longjmp(png_jmpbuf(png), 1);
+}
+
+static int ReadPNG(FILE* in_file, WebPPicture* const pic, int keep_alpha) {
+  png_structp png;
+  png_infop info;
+  int color_type, bit_depth, interlaced;
+  int has_alpha;
+  int num_passes;
+  int p;
+  int ok = 0;
+  png_uint_32 width, height, y;
+  int stride;
+  uint8_t* rgb = NULL;
+
+  png = png_create_read_struct(PNG_LIBPNG_VER_STRING, 0, 0, 0);
+  if (png == NULL) {
+    goto End;
+  }
+
+  png_set_error_fn(png, 0, error_function, NULL);
+  if (setjmp(png_jmpbuf(png))) {
+ Error:
+    png_destroy_read_struct(&png, NULL, NULL);
+    free(rgb);
+    goto End;
+  }
+
+  info = png_create_info_struct(png);
+  if (info == NULL) goto Error;
+
+  png_init_io(png, in_file);
+  png_read_info(png, info);
+  if (!png_get_IHDR(png, info,
+                    &width, &height, &bit_depth, &color_type, &interlaced,
+                    NULL, NULL)) goto Error;
+
+  png_set_strip_16(png);
+  png_set_packing(png);
+  if (color_type == PNG_COLOR_TYPE_PALETTE) png_set_palette_to_rgb(png);
+  if (color_type == PNG_COLOR_TYPE_GRAY ||
+      color_type == PNG_COLOR_TYPE_GRAY_ALPHA) {
+    if (bit_depth < 8) {
+      png_set_expand_gray_1_2_4_to_8(png);
+    }
+    png_set_gray_to_rgb(png);
+  }
+  if (png_get_valid(png, info, PNG_INFO_tRNS)) {
+    png_set_tRNS_to_alpha(png);
+    has_alpha = 1;
+  } else {
+    has_alpha = !!(color_type & PNG_COLOR_MASK_ALPHA);
+  }
+
+  if (!keep_alpha) {
+    png_set_strip_alpha(png);
+    has_alpha = 0;
+  }
+
+  num_passes = png_set_interlace_handling(png);
+  png_read_update_info(png, info);
+  stride = (has_alpha ? 4 : 3) * width * sizeof(*rgb);
+  rgb = (uint8_t*)malloc(stride * height);
+  if (rgb == NULL) goto Error;
+  for (p = 0; p < num_passes; ++p) {
+    for (y = 0; y < height; ++y) {
+      png_bytep row = rgb + y * stride;
+      png_read_rows(png, &row, NULL, 1);
+    }
+  }
+  png_read_end(png, info);
+  png_destroy_read_struct(&png, &info, NULL);
+
+  pic->width = width;
+  pic->height = height;
+  ok = has_alpha ? WebPPictureImportRGBA(pic, rgb, stride)
+                 : WebPPictureImportRGB(pic, rgb, stride);
+  free(rgb);
+
+  if (ok && has_alpha && keep_alpha == 2) {
+    WebPCleanupTransparentArea(pic);
+  }
+
+ End:
+  return ok;
+}
+#else
+static int ReadPNG(FILE* in_file, WebPPicture* const pic, int keep_alpha) {
+  (void)in_file;
+  (void)pic;
+  (void)keep_alpha;
+  fprintf(stderr, "PNG support not compiled. Please install the libpng "
+          "development package before building.\n");
+  return 0;
+}
+#endif
+
+#ifdef WEBP_HAVE_TIFF
+static int ReadTIFF(const char* const filename,
+                    WebPPicture* const pic, int keep_alpha) {
+  TIFF* const tif = TIFFOpen(filename, "r");
+  uint32 width, height;
+  uint32* raster;
+  int ok = 0;
+  int dircount = 1;
+
+  if (tif == NULL) {
+    fprintf(stderr, "Error! Cannot open TIFF file '%s'\n", filename);
+    return 0;
+  }
+
+  while (TIFFReadDirectory(tif)) ++dircount;
+
+  if (dircount > 1) {
+    fprintf(stderr, "Warning: multi-directory TIFF files are not supported.\n"
+                    "Only the first will be used, %d will be ignored.\n",
+                    dircount - 1);
+  }
+
+  TIFFGetField(tif, TIFFTAG_IMAGEWIDTH, &width);
+  TIFFGetField(tif, TIFFTAG_IMAGELENGTH, &height);
+  raster = (uint32*)_TIFFmalloc(width * height * sizeof(*raster));
+  if (raster != NULL) {
+    if (TIFFReadRGBAImageOriented(tif, width, height, raster,
+                                  ORIENTATION_TOPLEFT, 1)) {
+      const int stride = width * sizeof(*raster);
+      pic->width = width;
+      pic->height = height;
+      // TIFF data is ABGR
+#ifdef __BIG_ENDIAN__
+      TIFFSwabArrayOfLong(raster, width * height);
+#endif
+      ok = keep_alpha
+         ? WebPPictureImportRGBA(pic, (const uint8_t*)raster, stride)
+         : WebPPictureImportRGBX(pic, (const uint8_t*)raster, stride);
+    }
+    _TIFFfree(raster);
+  } else {
+    fprintf(stderr, "Error allocating TIFF RGBA memory!\n");
+  }
+
+  if (ok && keep_alpha == 2) {
+    WebPCleanupTransparentArea(pic);
+  }
+
+  TIFFClose(tif);
+  return ok;
+}
+#else
+static int ReadTIFF(const char* const filename,
+                    WebPPicture* const pic, int keep_alpha) {
+  (void)filename;
+  (void)pic;
+  (void)keep_alpha;
+  fprintf(stderr, "TIFF support not compiled. Please install the libtiff "
+          "development package before building.\n");
+  return 0;
+}
+#endif
 
 typedef enum {
   PNG_ = 0,
@@ -129,7 +578,7 @@ static InputFileFormat GetImageType(FILE* in_file) {
 }
 
 static int ReadPicture(const char* const filename, WebPPicture* const pic,
-                       int keep_alpha, Metadata* const metadata) {
+                       int keep_alpha) {
   int ok = 0;
   FILE* in_file = fopen(filename, "rb");
   if (in_file == NULL) {
@@ -141,11 +590,11 @@ static int ReadPicture(const char* const filename, WebPPicture* const pic,
     // If no size specified, try to decode it as PNG/JPEG (as appropriate).
     const InputFileFormat format = GetImageType(in_file);
     if (format == PNG_) {
-      ok = ReadPNG(in_file, pic, keep_alpha, metadata);
+      ok = ReadPNG(in_file, pic, keep_alpha);
     } else if (format == JPEG_) {
-      ok = ReadJPEG(in_file, pic, metadata);
+      ok = ReadJPEG(in_file, pic);
     } else if (format == TIFF_) {
-      ok = ReadTIFF(filename, pic, keep_alpha, metadata);
+      ok = ReadTIFF(filename, pic, keep_alpha);
     }
   } else {
     // If image size is specified, infer it as YUV format.
@@ -356,139 +805,6 @@ static int DumpPicture(const WebPPicture* const picture, const char* PGM_name) {
   return 1;
 }
 
-// -----------------------------------------------------------------------------
-// Metadata writing.
-
-enum {
-  METADATA_EXIF = (1 << 0),
-  METADATA_ICCP = (1 << 1),
-  METADATA_XMP  = (1 << 2),
-  METADATA_ALL  = METADATA_EXIF | METADATA_ICCP | METADATA_XMP
-};
-
-static const int kChunkHeaderSize = 8;
-static const int kTagSize = 4;
-
-// Outputs, in little endian, 'num' bytes from 'val' to 'out'.
-static int WriteLE(FILE* const out, uint32_t val, int num) {
-  uint8_t buf[4];
-  int i;
-  for (i = 0; i < num; ++i) {
-    buf[i] = (uint8_t)(val & 0xff);
-    val >>= 8;
-  }
-  return (fwrite(buf, num, 1, out) == 1);
-}
-
-static int WriteLE24(FILE* const out, uint32_t val) {
-  return WriteLE(out, val, 3);
-}
-
-static int WriteLE32(FILE* const out, uint32_t val) {
-  return WriteLE(out, val, 4);
-}
-
-static int WriteMetadataChunk(FILE* const out, const char fourcc[4],
-                              const MetadataPayload* const payload) {
-  const uint8_t zero = 0;
-  const size_t need_padding = payload->size & 1;
-  int ok = (fwrite(fourcc, kTagSize, 1, out) == 1);
-  ok = ok && WriteLE32(out, (uint32_t)payload->size);
-  ok = ok && (fwrite(payload->bytes, payload->size, 1, out) == 1);
-  return ok && (fwrite(&zero, need_padding, need_padding, out) == need_padding);
-}
-
-// Sets 'flag' in 'vp8x_flags' and updates 'metadata_size' with the size of the
-// chunk if there is metadata and 'keep' is true.
-static int UpdateFlagsAndSize(const MetadataPayload* const payload,
-                              int keep, int flag,
-                              uint32_t* vp8x_flags, uint64_t* metadata_size) {
-  if (keep && payload->bytes != NULL && payload->size > 0) {
-    *vp8x_flags |= flag;
-    *metadata_size += kChunkHeaderSize + payload->size + (payload->size & 1);
-    return 1;
-  }
-  return 0;
-}
-
-// Writes a WebP file using the image contained in 'memory_writer' and the
-// metadata from 'metadata'. Metadata is controlled by 'keep_metadata' and the
-// availability in 'metadata'. Returns true on success.
-// For details see doc/webp-container-spec.txt#extended-file-format.
-static int WriteWebPWithMetadata(FILE* const out,
-                                 const WebPPicture* const picture,
-                                 const WebPMemoryWriter* const memory_writer,
-                                 const Metadata* const metadata,
-                                 int keep_metadata) {
-  const char kVP8XHeader[] = "VP8X\x0a\x00\x00\x00";
-  const int kAlphaFlag = 0x10;
-  const int kEXIFFlag  = 0x08;
-  const int kICCPFlag  = 0x20;
-  const int kXMPFlag   = 0x04;
-  const size_t kRiffHeaderSize = 12;
-  const size_t kMaxChunkPayload = ~0 - kChunkHeaderSize - 1;
-  const size_t kMinSize = kRiffHeaderSize + kChunkHeaderSize;
-  uint32_t flags = 0;
-  uint64_t metadata_size = 0;
-  const int write_exif = UpdateFlagsAndSize(&metadata->exif,
-                                            !!(keep_metadata & METADATA_EXIF),
-                                            kEXIFFlag, &flags, &metadata_size);
-  const int write_iccp = UpdateFlagsAndSize(&metadata->iccp,
-                                            !!(keep_metadata & METADATA_ICCP),
-                                            kICCPFlag, &flags, &metadata_size);
-  const int write_xmp  = UpdateFlagsAndSize(&metadata->xmp,
-                                            !!(keep_metadata & METADATA_XMP),
-                                            kXMPFlag, &flags, &metadata_size);
-  uint8_t* webp = memory_writer->mem;
-  size_t webp_size = memory_writer->size;
-  if (webp_size < kMinSize) return 0;
-  if (webp_size - kChunkHeaderSize + metadata_size > kMaxChunkPayload) {
-    fprintf(stderr, "Error! Addition of metadata would exceed "
-                    "container size limit.\n");
-    return 0;
-  }
-
-  if (metadata_size > 0) {
-    const int kVP8XChunkSize = 18;
-    const int has_vp8x = !memcmp(webp + kRiffHeaderSize, "VP8X", kTagSize);
-    const uint32_t riff_size = (uint32_t)(webp_size - kChunkHeaderSize +
-                                          (has_vp8x ? 0 : kVP8XChunkSize) +
-                                          metadata_size);
-    // RIFF
-    int ok = (fwrite(webp, kTagSize, 1, out) == 1);
-    // RIFF size (file header size is not recorded)
-    ok = ok && WriteLE32(out, riff_size);
-    webp += kChunkHeaderSize;
-    webp_size -= kChunkHeaderSize;
-    // WEBP
-    ok = ok && (fwrite(webp, kTagSize, 1, out) == 1);
-    webp += kTagSize;
-    webp_size -= kTagSize;
-    if (has_vp8x) {  // update the existing VP8X flags
-      webp[kChunkHeaderSize] |= (uint8_t)(flags & 0xff);
-      ok = ok && (fwrite(webp, kVP8XChunkSize, 1, out) == 1);
-      webp_size -= kVP8XChunkSize;
-    } else {
-      const int is_lossless = !memcmp(webp, "VP8L", kTagSize);
-      // The alpha flag is forced with lossless images.
-      if (is_lossless) flags |= kAlphaFlag;
-      ok = ok && (fwrite(kVP8XHeader, kChunkHeaderSize, 1, out) == 1);
-      ok = ok && WriteLE32(out, flags);
-      ok = ok && WriteLE24(out, picture->width - 1);
-      ok = ok && WriteLE24(out, picture->height - 1);
-    }
-    if (write_iccp) ok = ok && WriteMetadataChunk(out, "ICCP", &metadata->iccp);
-    // Image
-    ok = ok && (fwrite(webp, webp_size, 1, out) == 1);
-    if (write_exif) ok = ok && WriteMetadataChunk(out, "EXIF", &metadata->exif);
-    if (write_xmp)  ok = ok && WriteMetadataChunk(out, "XMP ", &metadata->xmp);
-    return ok;
-  } else {
-    // No metadata, just write the original image file.
-    return (fwrite(webp, webp_size, 1, out) == 1);
-  }
-}
-
 //------------------------------------------------------------------------------
 
 static int ProgressReport(int percent, const WebPPicture* const picture) {
@@ -548,9 +864,8 @@ static void HelpLong(void) {
   printf("  -444 / -422 / -gray ..... Change colorspace\n");
 #endif
   printf("  -map <int> ............. print map of extra info.\n");
-  printf("  -print_psnr ............ prints averaged PSNR distortion.\n");
   printf("  -print_ssim ............ prints averaged SSIM distortion.\n");
-  printf("  -print_lsim ............ prints local-similarity distortion.\n");
+  printf("  -print_psnr ............ prints averaged PSNR distortion.\n");
   printf("  -d <file.pgm> .......... dump the compressed output (PGM file).\n");
   printf("  -alpha_method <int> .... Transparency-compression method (0..1)\n");
   printf("  -alpha_filter <string> . predictive filtering for alpha plane.\n");
@@ -560,13 +875,6 @@ static void HelpLong(void) {
   printf("  -lossless .............. Encode image losslessly.\n");
   printf("  -hint <string> ......... Specify image characteristics hint.\n");
   printf("                           One of: photo, picture or graph\n");
-
-  printf("\n");
-  printf("  -metadata <string> ..... comma separated list of metadata to\n");
-  printf("                           ");
-  printf("copy from the input to the output if present.\n");
-  printf("                           "
-         "Valid values: all, none (default), exif, iccp, xmp\n");
 
   printf("\n");
   printf("  -short ................. condense printed message\n");
@@ -620,18 +928,13 @@ int main(int argc, const char *argv[]) {
   int crop = 0, crop_x = 0, crop_y = 0, crop_w = 0, crop_h = 0;
   int resize_w = 0, resize_h = 0;
   int show_progress = 0;
-  int keep_metadata = 0;
   WebPPicture picture;
-  int print_distortion = -1;        // -1=off, 0=PSNR, 1=SSIM, 2=LSIM
+  int print_distortion = 0;        // 1=PSNR, 2=SSIM
   WebPPicture original_picture;    // when PSNR or SSIM is requested
   WebPConfig config;
   WebPAuxStats stats;
-  WebPMemoryWriter memory_writer;
-  Metadata metadata;
   Stopwatch stop_watch;
 
-  MetadataInit(&metadata);
-  WebPMemoryWriterInit(&memory_writer);
   if (!WebPPictureInit(&picture) ||
       !WebPPictureInit(&original_picture) ||
       !WebPConfigInit(&config)) {
@@ -656,15 +959,12 @@ int main(int argc, const char *argv[]) {
     } else if (!strcmp(argv[c], "-d") && c < argc - 1) {
       dump_file = argv[++c];
       config.show_compressed = 1;
-    } else if (!strcmp(argv[c], "-print_psnr")) {
-      config.show_compressed = 1;
-      print_distortion = 0;
     } else if (!strcmp(argv[c], "-print_ssim")) {
       config.show_compressed = 1;
-      print_distortion = 1;
-    } else if (!strcmp(argv[c], "-print_lsim")) {
-      config.show_compressed = 1;
       print_distortion = 2;
+    } else if (!strcmp(argv[c], "-print_psnr")) {
+      config.show_compressed = 1;
+      print_distortion = 1;
     } else if (!strcmp(argv[c], "-short")) {
       short_output++;
     } else if (!strcmp(argv[c], "-s") && c < argc - 2) {
@@ -786,52 +1086,6 @@ int main(int argc, const char *argv[]) {
         fprintf(stderr, "Error! Could initialize configuration with preset.\n");
         goto Error;
       }
-    } else if (!strcmp(argv[c], "-metadata") && c < argc - 1) {
-      static const struct {
-        const char* option;
-        int flag;
-      } kTokens[] = {
-        { "all",  METADATA_ALL },
-        { "none", 0 },
-        { "exif", METADATA_EXIF },
-        { "iccp", METADATA_ICCP },
-        { "xmp",  METADATA_XMP },
-      };
-      const size_t kNumTokens = sizeof(kTokens) / sizeof(kTokens[0]);
-      const char* start = argv[++c];
-      const char* const end = start + strlen(start);
-
-      while (start < end) {
-        size_t i;
-        const char* token = strchr(start, ',');
-        if (token == NULL) token = end;
-
-        for (i = 0; i < kNumTokens; ++i) {
-          if ((size_t)(token - start) == strlen(kTokens[i].option) &&
-              !strncmp(start, kTokens[i].option, strlen(kTokens[i].option))) {
-            if (kTokens[i].flag != 0) {
-              keep_metadata |= kTokens[i].flag;
-            } else {
-              keep_metadata = 0;
-            }
-            break;
-          }
-        }
-        if (i == kNumTokens) {
-          fprintf(stderr, "Error! Unknown metadata type '%.*s'\n",
-                  (int)(token - start), start);
-          HelpLong();
-          return -1;
-        }
-        start = token + 1;
-      }
-#ifdef HAVE_WINCODEC_H
-      if (keep_metadata != 0 && keep_metadata != METADATA_ICCP) {
-        // TODO(jzern): remove when -metadata is supported on all platforms.
-        fprintf(stderr, "Warning: only ICC profile extraction is currently"
-                        " supported on this platform!\n");
-      }
-#endif
     } else if (!strcmp(argv[c], "-v")) {
       verbose = 1;
     } else if (argv[c][0] == '-') {
@@ -870,19 +1124,15 @@ int main(int argc, const char *argv[]) {
   if (verbose) {
     StopwatchReadAndReset(&stop_watch);
   }
-  if (!ReadPicture(in_file, &picture, keep_alpha,
-                   (keep_metadata == 0) ? NULL : &metadata)) {
+  if (!ReadPicture(in_file, &picture, keep_alpha)) {
     fprintf(stderr, "Error! Cannot read input picture file '%s'\n", in_file);
     goto Error;
   }
   picture.progress_hook = (show_progress && !quiet) ? ProgressReport : NULL;
-  if (keep_alpha == 2) {
-    WebPCleanupTransparentArea(&picture);
-  }
 
   if (verbose) {
-    const double read_time = StopwatchReadAndReset(&stop_watch);
-    fprintf(stderr, "Time to read input: %.3fs\n", read_time);
+    const double time = StopwatchReadAndReset(&stop_watch);
+    fprintf(stderr, "Time to read input: %.3fs\n", time);
   }
 
   // Open the output
@@ -896,13 +1146,8 @@ int main(int argc, const char *argv[]) {
         fprintf(stderr, "Saving file '%s'\n", out_file);
       }
     }
-    if (keep_metadata == 0) {
-      picture.writer = MyWriter;
-      picture.custom_ptr = (void*)out;
-    } else {
-      picture.writer = WebPMemoryWrite;
-      picture.custom_ptr = (void*)&memory_writer;
-    }
+    picture.writer = MyWriter;
+    picture.custom_ptr = (void*)out;
   } else {
     out = NULL;
     if (!quiet && !short_output) {
@@ -935,7 +1180,7 @@ int main(int argc, const char *argv[]) {
   if (picture.extra_info_type > 0) {
     AllocExtraInfo(&picture);
   }
-  if (print_distortion >= 0) {  // Save original picture for later comparison
+  if (print_distortion > 0) {  // Save original picture for later comparison
     WebPPictureCopy(&picture, &original_picture);
   }
   if (!WebPEncode(&config, &picture)) {
@@ -945,8 +1190,8 @@ int main(int argc, const char *argv[]) {
     goto Error;
   }
   if (verbose) {
-    const double encode_time = StopwatchReadAndReset(&stop_watch);
-    fprintf(stderr, "Time to encode picture: %.3fs\n", encode_time);
+    const double time = StopwatchReadAndReset(&stop_watch);
+    fprintf(stderr, "Time to encode picture: %.3fs\n", time);
   }
 
   // Write info
@@ -958,14 +1203,6 @@ int main(int argc, const char *argv[]) {
     }
   }
 
-  if (keep_metadata != 0 && out != NULL) {
-    if (!WriteWebPWithMetadata(out, &picture, &memory_writer,
-                               &metadata, keep_metadata)) {
-      fprintf(stderr, "Error writing WebP file with metadata!\n");
-      goto Error;
-    }
-  }
-
   if (!quiet) {
     if (config.lossless) {
       PrintExtraInfoLossless(&picture, short_output, in_file);
@@ -973,21 +1210,18 @@ int main(int argc, const char *argv[]) {
       PrintExtraInfoLossy(&picture, short_output, in_file);
     }
   }
-  if (!quiet && !short_output && print_distortion >= 0) {  // print distortion
-    static const char* distortion_names[] = { "PSNR", "SSIM", "LSIM" };
+  if (!quiet && !short_output && print_distortion > 0) {  // print distortion
     float values[5];
     WebPPictureDistortion(&picture, &original_picture,
-                          print_distortion, values);
+                          (print_distortion == 1) ? 0 : 1, values);
     fprintf(stderr, "%s: Y:%.2f U:%.2f V:%.2f A:%.2f  Total:%.2f\n",
-            distortion_names[print_distortion],
+            (print_distortion == 1) ? "PSNR" : "SSIM",
             values[0], values[1], values[2], values[3], values[4]);
   }
   return_value = 0;
 
  Error:
-  free(memory_writer.mem);
   free(picture.extra_info);
-  MetadataFree(&metadata);
   WebPPictureFree(&picture);
   WebPPictureFree(&original_picture);
   if (out != NULL) {

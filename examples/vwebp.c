@@ -20,7 +20,7 @@
 #include <string.h>
 
 #include "webp/decode.h"
-#include "webp/demux.h"
+#include "webp/mux.h"
 
 #ifdef __APPLE__
 #include <GLUT/glut.h>
@@ -46,17 +46,22 @@ static struct {
   int decoding_error;
   int print_info;
 
-  int canvas_width, canvas_height;
+  uint32_t flags;
   int loop_count;
-  uint32_t bg_color;
+  int frame_num;
+  int frame_max;
 
   const char* file_name;
   WebPData data;
+  WebPMux* mux;
   WebPDecoderConfig* config;
   const WebPDecBuffer* pic;
-  WebPDemuxer* dmux;
-  WebPIterator frameiter;
-} kParams;
+} kParams = {
+  0, 0, 0, 0,         // has_animation, ...
+  0, 1, 1, 0,         // flags, ...
+  NULL, { NULL, 0 },  // file_name, ...
+  NULL, NULL, NULL    // mux, ...
+};
 
 static void ClearPreviousPic(void) {
   WebPFreeDecBuffer((WebPDecBuffer*)kParams.pic);
@@ -66,9 +71,8 @@ static void ClearPreviousPic(void) {
 static void ClearParams(void) {
   ClearPreviousPic();
   WebPDataClear(&kParams.data);
-  WebPDemuxReleaseIterator(&kParams.frameiter);
-  WebPDemuxDelete(kParams.dmux);
-  kParams.dmux = NULL;
+  WebPMuxDelete(kParams.mux);
+  kParams.mux = NULL;
 }
 
 //------------------------------------------------------------------------------
@@ -108,10 +112,6 @@ static void PrintString(const char* const text) {
   }
 }
 
-static float GetColorf(uint32_t color, int shift) {
-  return (color >> shift) / 255.f;
-}
-
 static void DrawCheckerBoard(void) {
   const int square_size = 8;  // must be a power of 2
   int x, y;
@@ -133,20 +133,15 @@ static void DrawCheckerBoard(void) {
 }
 
 static void HandleDisplay(void) {
-  const WebPDecBuffer* const pic = kParams.pic;
-  const WebPIterator* const iter = &kParams.frameiter;
-  GLfloat xoff, yoff;
+  const WebPDecBuffer* pic = kParams.pic;
   if (pic == NULL) return;
+  glClear(GL_COLOR_BUFFER_BIT);
   glPushMatrix();
   glPixelZoom(1, -1);
-  xoff = (GLfloat)(2. * iter->x_offset / kParams.canvas_width);
-  yoff = (GLfloat)(2. * iter->y_offset / kParams.canvas_height);
-  glRasterPos2f(-1. + xoff, 1. - yoff);
+  glRasterPos2f(-1, 1);
   glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
   glPixelStorei(GL_UNPACK_ROW_LENGTH, pic->u.RGBA.stride / 4);
-  if (iter->dispose_method == WEBP_MUX_DISPOSE_BACKGROUND) {
-    glClear(GL_COLOR_BUFFER_BIT);  // use clear color
-  }
+  DrawCheckerBoard();
   glDrawPixels(pic->width, pic->height,
                GL_RGBA, GL_UNSIGNED_BYTE,
                (GLvoid*)pic->u.RGBA.rgba);
@@ -161,52 +156,56 @@ static void HandleDisplay(void) {
     glColor4f(0.0, 0.0, 0.0, 1.0);
     glRasterPos2f(-0.95f, 0.80f);
     PrintString(tmp);
-    if (iter->x_offset != 0 || iter->y_offset != 0) {
-      snprintf(tmp, sizeof(tmp), " (offset:%d,%d)",
-               iter->x_offset, iter->y_offset);
-      glRasterPos2f(-0.95f, 0.70f);
-      PrintString(tmp);
-    }
   }
   glPopMatrix();
   glFlush();
 }
 
-static void StartDisplay(void) {
-  const int width = kParams.canvas_width;
-  const int height = kParams.canvas_height;
+static void StartDisplay(const WebPDecBuffer* const pic) {
   glutInitDisplayMode(GLUT_RGBA);
-  glutInitWindowSize(width, height);
+  glutInitWindowSize(pic->width, pic->height);
   glutCreateWindow("WebP viewer");
   glutDisplayFunc(HandleDisplay);
   glutIdleFunc(NULL);
   glutKeyboardFunc(HandleKey);
   glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
   glEnable(GL_BLEND);
-  glClearColor(GetColorf(kParams.bg_color, 0),
-               GetColorf(kParams.bg_color, 8),
-               GetColorf(kParams.bg_color, 16),
-               GetColorf(kParams.bg_color, 24));
-  HandleReshape(width, height);
-  glClear(GL_COLOR_BUFFER_BIT);
-  DrawCheckerBoard();
+  glClearColor(0.0, 0.0, 0.0, 0.0);
+  HandleReshape(pic->width, pic->height);
 }
 
 //------------------------------------------------------------------------------
 // File decoding
 
-static int Decode(void) {   // Fills kParams.frameiter
-  const WebPIterator* const iter = &kParams.frameiter;
+static int Decode(const int frame_number, int* const duration) {
   WebPDecoderConfig* const config = kParams.config;
+  WebPData *data, image_data;
+  int x_off = 0, y_off = 0;
   WebPDecBuffer* const output_buffer = &config->output;
   int ok = 0;
 
   ClearPreviousPic();
+  if (kParams.has_animation) {
+    if (WebPMuxGetFrame(kParams.mux, frame_number, &image_data,
+                        &x_off, &y_off, duration) != WEBP_MUX_OK) {
+      goto end;
+    }
+    if (x_off != 0 || y_off != 0) {
+      fprintf(stderr,
+              "Frame offsets not yet supported! Forcing offset to 0,0\n");
+      x_off = y_off = 0;
+    }
+    data = &image_data;
+  } else {
+    data = &kParams.data;
+  }
+
   output_buffer->colorspace = MODE_RGBA;
-  ok = (WebPDecode(iter->fragment.bytes, iter->fragment.size,
-                   config) == VP8_STATUS_OK);
+  ok = (WebPDecode(data->bytes_, data->size_, config) == VP8_STATUS_OK);
+
+ end:
   if (!ok) {
-    fprintf(stderr, "Decoding of frame #%d failed!\n", iter->frame_num);
+    fprintf(stderr, "Decoding of frame #%d failed!\n", frame_number);
   } else {
     kParams.pic = output_buffer;
   }
@@ -216,28 +215,21 @@ static int Decode(void) {   // Fills kParams.frameiter
 static void decode_callback(int what) {
   if (what == 0 && !kParams.done) {
     int duration = 0;
-    if (kParams.dmux != NULL) {
-      WebPIterator* const iter = &kParams.frameiter;
-      if (!WebPDemuxNextFrame(iter)) {
-        WebPDemuxReleaseIterator(iter);
-        if (WebPDemuxGetFrame(kParams.dmux, 1, iter)) {
+    if (kParams.mux != NULL) {
+      if (!Decode(kParams.frame_num, &duration)) {
+        kParams.decoding_error = 1;
+        kParams.done = 1;
+      } else {
+        ++kParams.frame_num;
+        if (kParams.frame_num > kParams.frame_max) {
+          kParams.frame_num = 1;
           --kParams.loop_count;
           kParams.done = (kParams.loop_count == 0);
-        } else {
-          kParams.decoding_error = 1;
-          kParams.done = 1;
-          return;
         }
       }
-      duration = iter->duration;
     }
-    if (!Decode()) {
-      kParams.decoding_error = 1;
-      kParams.done = 1;
-    } else {
-      glutPostRedisplay();
-      glutTimerFunc(duration, decode_callback, what);
-    }
+    glutPostRedisplay();
+    glutTimerFunc(duration, decode_callback, what);
   }
 }
 
@@ -252,13 +244,15 @@ static void Help(void) {
          "  -nofancy ..... don't use the fancy YUV420 upscaler.\n"
          "  -nofilter .... disable in-loop filtering.\n"
          "  -mt .......... use multi-threading\n"
-         "  -info ........ print info.\n"
+         "  -crop <x> <y> <w> <h> ... crop output with the given rectangle\n"
+         "  -scale <w> <h> .......... scale the output (*after* any cropping)\n"
          "  -h     ....... this help message.\n"
         );
 }
 
 int main(int argc, char *argv[]) {
   WebPDecoderConfig config;
+  WebPMuxError mux_err;
   int c;
 
   if (!WebPInitDecoderConfig(&config)) {
@@ -275,8 +269,6 @@ int main(int argc, char *argv[]) {
       config.options.no_fancy_upsampling = 1;
     } else if (!strcmp(argv[c], "-nofilter")) {
       config.options.bypass_filtering = 1;
-    } else if (!strcmp(argv[c], "-info")) {
-      kParams.print_info = 1;
     } else if (!strcmp(argv[c], "-version")) {
       const int version = WebPGetDecoderVersion();
       printf("%d.%d.%d\n",
@@ -284,6 +276,16 @@ int main(int argc, char *argv[]) {
       return 0;
     } else if (!strcmp(argv[c], "-mt")) {
       config.options.use_threads = 1;
+    } else if (!strcmp(argv[c], "-crop") && c < argc - 4) {
+      config.options.use_cropping = 1;
+      config.options.crop_left   = strtol(argv[++c], NULL, 0);
+      config.options.crop_top    = strtol(argv[++c], NULL, 0);
+      config.options.crop_width  = strtol(argv[++c], NULL, 0);
+      config.options.crop_height = strtol(argv[++c], NULL, 0);
+    } else if (!strcmp(argv[c], "-scale") && c < argc - 2) {
+      config.options.use_scaling = 1;
+      config.options.scaled_width  = strtol(argv[++c], NULL, 0);
+      config.options.scaled_height = strtol(argv[++c], NULL, 0);
     } else if (argv[c][0] == '-') {
       printf("Unknown option '%s'\n", argv[c]);
       Help();
@@ -300,49 +302,53 @@ int main(int argc, char *argv[]) {
   }
 
   if (!ExUtilReadFile(kParams.file_name,
-                      &kParams.data.bytes, &kParams.data.size)) {
+                      &kParams.data.bytes_, &kParams.data.size_)) {
     goto Error;
   }
 
-  kParams.dmux = WebPDemux(&kParams.data);
-  if (kParams.dmux == NULL) {
+  kParams.mux = WebPMuxCreate(&kParams.data, 0);
+  if (kParams.mux == NULL) {
     fprintf(stderr, "Could not create demuxing object!\n");
     goto Error;
   }
 
-  if (WebPDemuxGetI(kParams.dmux, WEBP_FF_FORMAT_FLAGS) & FRAGMENTS_FLAG) {
-    fprintf(stderr, "Image fragments are not supported for now!\n");
+  mux_err = WebPMuxGetFeatures(kParams.mux, &kParams.flags);
+  if (mux_err != WEBP_MUX_OK) {
     goto Error;
   }
-  kParams.canvas_width = WebPDemuxGetI(kParams.dmux, WEBP_FF_CANVAS_WIDTH);
-  kParams.canvas_height = WebPDemuxGetI(kParams.dmux, WEBP_FF_CANVAS_HEIGHT);
-  if (kParams.print_info) {
-    printf("Canvas: %d x %d\n", kParams.canvas_width, kParams.canvas_height);
+  if (kParams.flags & TILE_FLAG) {
+    fprintf(stderr, "Tiling is not supported for now!\n");
+    goto Error;
   }
 
-  if (!WebPDemuxGetFrame(kParams.dmux, 1, &kParams.frameiter)) goto Error;
+  kParams.has_animation = !!(kParams.flags & ANIMATION_FLAG);
 
-  kParams.has_animation = (kParams.frameiter.num_frames > 1);
-  kParams.loop_count = (int)WebPDemuxGetI(kParams.dmux, WEBP_FF_LOOP_COUNT);
-  kParams.bg_color = WebPDemuxGetI(kParams.dmux, WEBP_FF_BACKGROUND_COLOR);
-  printf("VP8X: Found %d images in file (loop count = %d)\n",
-         kParams.frameiter.num_frames, kParams.loop_count);
+  if (kParams.has_animation) {
+    mux_err = WebPMuxGetLoopCount(kParams.mux, &kParams.loop_count);
+    if (mux_err != WEBP_MUX_OK && mux_err != WEBP_MUX_NOT_FOUND) {
+      goto Error;
+    }
+    mux_err = WebPMuxNumChunks(kParams.mux, WEBP_CHUNK_IMAGE,
+                                      &kParams.frame_max);
+    if (mux_err != WEBP_MUX_OK) {
+      goto Error;
+    }
+    printf("VP8X: Found %d images in file (loop count = %d)\n",
+           kParams.frame_max, kParams.loop_count);
+  }
 
   // Decode first frame
-  if (!Decode()) goto Error;
-
-  // Position iterator to last frame. Next call to HandleDisplay will wrap over.
-  // We take this into account by bumping up loop_count.
-  WebPDemuxGetFrame(kParams.dmux, 0, &kParams.frameiter);
-  if (kParams.loop_count) ++kParams.loop_count;
+  {
+    int duration;
+    if (!Decode(1, &duration)) goto Error;
+  }
 
   // Start display (and timer)
   glutInit(&argc, argv);
 #ifdef FREEGLUT
   glutSetOption(GLUT_ACTION_ON_WINDOW_CLOSE, GLUT_ACTION_CONTINUE_EXECUTION);
 #endif
-  StartDisplay();
-
+  StartDisplay(kParams.pic);
   if (kParams.has_animation) glutTimerFunc(0, decode_callback, 0);
   glutMainLoop();
 

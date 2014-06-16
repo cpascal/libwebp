@@ -75,7 +75,6 @@ AC_CHECK_HEADER(png.h,
                   PNG_INCLUDES="$PNG_INCLUDES -DWEBP_HAVE_PNG"
                   AC_DEFINE(WEBP_HAVE_PNG, [1],
                             [Set to 1 if PNG library is installed])
-                  png_support=yes
                  ],
                  [AC_MSG_WARN(Optional png library not found)
                   PNG_LIBS=""
@@ -110,7 +109,6 @@ AC_CHECK_HEADER(jpeglib.h,
                 JPEG_INCLUDES="$JPEG_INCLUDES -DWEBP_HAVE_JPEG"
                 AC_DEFINE(WEBP_HAVE_JPEG, [1],
                           [Set to 1 if JPEG library is installed])
-                jpeg_support=yes
                ],
                AC_MSG_WARN(Optional jpeg library not found),
                [$MATH_LIBS]),
@@ -139,7 +137,6 @@ AC_CHECK_HEADER(tiffio.h,
                 TIFF_INCLUDES="$TIFF_INCLUDES -DWEBP_HAVE_TIFF"
                 AC_DEFINE(WEBP_HAVE_TIFF, [1],
                           [Set to 1 if TIFF library is installed])
-                tiff_support=yes
                ],
                AC_MSG_WARN(Optional tiff library not found),
                [$MATH_LIBS]),
@@ -150,38 +147,6 @@ AC_SUBST(TIFF_INCLUDES)
 
 CPPFLAGS=$SAVED_CPPFLAGS
 LIBS=$SAVED_LIBS
-
-dnl === check for GIF support ===
-
-GIF_INCLUDES=""
-GIF_LIBS=""
-WITHLIB_OPTION([gif], [GIF])
-
-SAVED_CPPFLAGS=$CPPFLAGS
-SAVED_LIBS=$LIBS
-CPPFLAGS="$GIF_INCLUDES $CPPFLAGS"
-LIBS="$GIF_LIBS $LIBS"
-
-AC_CHECK_HEADER(gif_lib.h,
-  AC_CHECK_LIB([gif], [DGifOpenFileHandle],
-               [GIF_LIBS="$GIF_LIBS -lgif"
-                gif_support=yes
-               ],
-               AC_MSG_WARN(Optional gif library not found),
-               [$MATH_LIBS]),
-  AC_MSG_WARN(gif library not available - no gif_lib.h)
-)
-AC_SUBST(GIF_LIBS)
-AC_SUBST(GIF_INCLUDES)
-
-CPPFLAGS=$SAVED_CPPFLAGS
-LIBS=$SAVED_LIBS
-
-if test "$gif_support" = "yes" -a \
-        "$enable_experimental_libwebpmux" = "yes"; then
-  build_gif2webp=yes
-fi
-AM_CONDITIONAL([BUILD_GIF2WEBP], [test "${build_gif2webp}" = "yes"])
 
 dnl === check for WIC support ===
 
@@ -226,19 +191,6 @@ if test "$target_os" = "mingw32"; then
   fi
 fi
 
-dnl === If --enable-swap-16bit-csp is defined, add -DWEBP_SWAP_16BIT_CSP
-
-USE_SWAP_16BIT_CSP=""
-AC_MSG_CHECKING(if --enable-swap-16bit-csp option is specified)
-AC_ARG_ENABLE([swap-16bit-csp],
-              AS_HELP_STRING([--enable-swap-16bit-csp],
-                             [Enable byte swap for 16 bit colorspaces]))
-if test "$enable_swap_16bit_csp" = "yes"; then
-  USE_SWAP_16BIT_CSP="-DWEBP_SWAP_16BIT_CSP"
-fi
-AC_MSG_RESULT(${enable_swap_16bit_csp-no})
-AC_SUBST(USE_SWAP_16BIT_CSP)
-
 dnl === If --enable-experimental is defined, add -DWEBP_EXPERIMENTAL_FEATURES
 
 USE_EXPERIMENTAL_CODE=""
@@ -260,22 +212,6 @@ AC_ARG_ENABLE([experimental-libwebpmux],
 AC_MSG_RESULT(${enable_experimental_libwebpmux-no})
 AM_CONDITIONAL([WANT_MUX], [test "$enable_experimental_libwebpmux" = "yes"])
 
-dnl === Check whether libwebpdemux should be built
-AC_MSG_CHECKING(whether libwebpdemux is to be built)
-AC_ARG_ENABLE([experimental-libwebpdemux],
-              AS_HELP_STRING([--enable-experimental-libwebpdemux],
-                             [Build libwebpdemux @<:@default=no@:>@]))
-AC_MSG_RESULT(${enable_experimental_libwebpdemux-no})
-AM_CONDITIONAL([WANT_DEMUX], [test "$enable_experimental_libwebpdemux" = "yes"])
-
-dnl === Check whether decoder library should be built.
-AC_MSG_CHECKING(whether decoder library is to be built)
-AC_ARG_ENABLE([libwebpdecoder],
-              AS_HELP_STRING([--enable-libwebpdecoder],
-                             [Build libwebpdecoder @<:@default=no@:>@]))
-AC_MSG_RESULT(${enable_libwebpdecoder-no})
-AM_CONDITIONAL([BUILD_LIBWEBPDECODER], [test "$enable_libwebpdecoder" = "yes"])
-
 dnl =========================
 
 AC_CONFIG_MACRO_DIR([m4])
@@ -283,38 +219,9 @@ AC_CONFIG_HEADERS([config.h])
 AC_CONFIG_FILES([Makefile src/Makefile man/Makefile \
                  examples/Makefile src/dec/Makefile \
                  src/enc/Makefile src/dsp/Makefile \
-                 src/demux/Makefile src/mux/Makefile \
                  src/utils/Makefile \
-                 src/libwebp.pc src/libwebpdecoder.pc])
+                 src/mux/Makefile \
+                 src/libwebp.pc])
 
 
 AC_OUTPUT
-
-AC_MSG_NOTICE([
-WebP Configuration Summary
---------------------------
-
-Shared libraries: ${enable_shared}
-Static libraries: ${enable_static}
-Threaded decode: ${enable_threading-no}
-libwebp: yes
-libwebpdecoder: ${enable_libwebpdecoder-no}
-libwebpdemux: ${enable_experimental_libwebpdemux-no}
-libwebpmux: ${enable_experimental_libwebpmux-no}
-
-Tools:
-cwebp: yes
-  Input format support
-  ====================
-  JPEG : ${jpeg_support-no}
-  PNG  : ${png_support-no}
-  TIFF : ${tiff_support-no}
-  WIC  : ${wic_support-no}
-dwebp: yes
-  Output format support
-  =====================
-  PNG  : ${png_support-no}
-  WIC  : ${wic_support-no}
-gif2webp: ${build_gif2webp-no}
-webpmux: ${enable_experimental_libwebpmux-no}
-])

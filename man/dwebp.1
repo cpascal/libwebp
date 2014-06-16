@@ -1,5 +1,5 @@
 .\"                                      Hey, EMACS: -*- nroff -*-
-.TH DWEBP 1 "February 01, 2013"
+.TH DWEBP 1 "August 2, 2012"
 .SH NAME
 dwebp \- decompress a WebP file to an image file
 .SH SYNOPSIS
@@ -21,7 +21,7 @@ Print usage summary.
 .B \-version
 Print the version number (as major.minor.revision) and exit.
 .TP
-.BI \-o " string
+.B \-o string
 Specify the name of the output file (as PNG format by default).
 .TP
 .B \-pam
@@ -31,15 +31,9 @@ Change the output format to PAM (retains alpha).
 Change the output format to PPM (discards alpha).
 .TP
 .B \-pgm
-Change the output format to PGM. The output consists of luma/chroma
+Change the output format to PGM. The output consist of luma/chroma
 samples instead of RGB, using the ICM4 layout. This option is mainly
-for verification and debugging purposes.
-.TP
-.B \-yuv
-Change the output format to raw YUV. The output consists of
-luma/chroma-U/chroma-V samples instead of RGB, saved sequentially as
-individual planes. This option is mainly for verification and debugging
-purposes.
+for verification and debugging purpose.
 .TP
 .B \-nofancy
 Don't use the fancy upscaler for YUV420. This may lead to jaggy
@@ -53,7 +47,7 @@ but will make the decoding faster.
 .B \-mt
 Use multi-threading for decoding, if possible.
 .TP
-.BI \-crop " x_position y_position width height
+.B \-crop x_position y_position width height
 Crop the decoded picture to a rectangle with top-left corner at coordinates
 (\fBx_position\fP, \fBy_position\fP) and size \fBwidth\fP x \fBheight\fP.
 This cropping area must be fully contained within the source rectangle.
@@ -61,7 +55,7 @@ The top-left corner will be snapped to even coordinates if needed.
 This option is meant to reduce the memory needed for cropping large images.
 Note: the cropping is applied \fIbefore\fP any scaling.
 .TP
-.BI \-scale " width height
+.B \-scale width height
 Rescale the decoded picture to dimension \fBwidth\fP x \fBheight\fP. This
 option is mostly intended to reducing the memory needed to decode large images,
 when only a small version is needed (thumbnail, preview, etc.).  Note: scaling
@@ -94,9 +88,7 @@ This manual page was written by Pascal Massimino <pascal.massimino@gmail.com>,
 for the Debian project (and may be used by others).
 
 .SH SEE ALSO
-.BR cwebp (1),
-.BR webpmux (1),
-.BR gif2webp (1).
+.BR cwebp (1).
 .br
 Please refer to http://developers.google.com/speed/webp/ for additional
 information.
